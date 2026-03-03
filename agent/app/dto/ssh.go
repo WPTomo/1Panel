@@ -50,6 +50,12 @@ type GenerateLoad struct {
 type SSHConf struct {
 	File string `json:"file"`
 }
+
+type SSHConfUpdate struct {
+	Key   string `json:"key" validate:"required"`
+	Path  string `json:"path"`
+	Value string `json:"value"`
+}
 type SearchSSHLog struct {
 	PageInfo
 	Info   string `json:"info"`

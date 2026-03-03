@@ -113,11 +113,20 @@
                 </el-row>
 
                 <div v-if="confShowType === 'all'">
+                    <el-alert type="info" :closable="false" :title="$t('ssh.confFileOrderHelper')" />
+                    <el-select v-model="allConfMode" class="mt-2 mini-form-item" @change="changeAllConfMode">
+                        <el-option
+                            v-for="item in sshConfOptions"
+                            :key="item.value"
+                            :value="item.value"
+                            :label="item.label"
+                        ></el-option>
+                    </el-select>
                     <CodemirrorPro
-                        :heightDiff="320"
+                        :heightDiff="459"
                         :minHeight="350"
                         class="mt-5"
-                        v-model="sshConf"
+                        v-model="allConfContent"
                         mode="nginx"
                         placeholder="# The SSH configuration file does not exist or is empty (/etc/ssh/sshd_config)"
                     ></CodemirrorPro>
@@ -137,7 +146,7 @@
 </template>
 
 <script lang="ts" setup>
-import { onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 import FireRouter from '@/views/host/ssh/index.vue';
 import AuthKeys from '@/views/host/ssh/ssh/auth-keys/index.vue';
 import Cert from '@/views/host/ssh/ssh/certification/index.vue';
@@ -160,8 +169,16 @@ const rootsRef = ref();
 const authKeyRef = ref();
 
 const autoStart = ref('enable');
+const allConfMode = ref('');
 
-const sshConf = ref();
+const sshConfPath = ref('');
+const sshConfOptions = ref<Array<{ value: string; label: string }>>([]);
+const allConfContent = computed({
+    get: () => sshConfPath.value,
+    set: (value: string) => {
+        sshConfPath.value = value;
+    },
+});
 const form = reactive({
     isActive: false,
     message: '',
@@ -185,7 +202,11 @@ const onSaveFile = async () => {
         type: 'info',
     }).then(async () => {
         loading.value = true;
-        await updateSSHByFile('sshdConf', sshConf.value)
+        if (!allConfMode.value) {
+            loading.value = false;
+            return;
+        }
+        await updateSSHByFile('sshdConfPath', sshConfPath.value, allConfMode.value)
             .then(() => {
                 loading.value = false;
                 MsgSuccess(i18n.global.t('commons.msg.operationSuccess'));
@@ -295,8 +316,27 @@ const changeI18n = (value: string) => {
 };
 
 const loadSSHConf = async () => {
-    const res = await loadSSHFile('sshdConf');
-    sshConf.value = res.data || '';
+    const optionsRes = await loadSSHFile('sshdConfOptions');
+    let options: Array<{ path: string; priority: number }> = [];
+    try {
+        options = JSON.parse(optionsRes.data || '[]');
+    } catch {
+        options = [];
+    }
+    const fileOptions = options.map((item) => ({
+        value: item.path,
+        label: i18n.global.t('ssh.confFileOrderLabel', [item.path, item.priority]),
+    }));
+    sshConfOptions.value = fileOptions;
+    if (!fileOptions.find((item) => item.value === allConfMode.value)) {
+        allConfMode.value = fileOptions.length > 0 ? fileOptions[0].value : '';
+    }
+    if (allConfMode.value) {
+        const fileRes = await loadSSHFile(`sshdConfPath:${allConfMode.value}`);
+        sshConfPath.value = fileRes.data || '';
+    } else {
+        sshConfPath.value = '';
+    }
 };
 
 const changeMode = async () => {
@@ -323,6 +363,15 @@ const search = async () => {
     form.permitRootLoginItem = loadPermitLabel(res.data.permitRootLogin);
     form.useDNS = res.data.useDNS;
     form.currentUser = res.data.currentUser;
+};
+
+const changeAllConfMode = async () => {
+    if (allConfMode.value) {
+        const res = await loadSSHFile(`sshdConfPath:${allConfMode.value}`);
+        sshConfPath.value = res.data || '';
+    } else {
+        sshConfPath.value = '';
+    }
 };
 
 const loadPermitLabel = (value: string) => {

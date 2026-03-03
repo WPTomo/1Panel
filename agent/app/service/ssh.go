@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,12 +37,22 @@ const sshPath = "/etc/ssh/sshd_config"
 
 type SSHService struct{}
 
+type sshConfigLine struct {
+	File string
+	Line string
+}
+
+type sshConfigOption struct {
+	Path     string `json:"path"`
+	Priority int    `json:"priority"`
+}
+
 type ISSHService interface {
 	GetSSHInfo() (*dto.SSHInfo, error)
 	OperateSSH(operation string) error
 	Update(req dto.SSHUpdate) error
 	LoadSSHFile(name string) (string, error)
-	UpdateByFile(req dto.SettingUpdate) error
+	UpdateByFile(req dto.SSHConfUpdate) error
 
 	LoadLog(ctx *gin.Context, req dto.SearchSSHLog) (int64, []dto.SSHHistory, error)
 	ExportLog(ctx *gin.Context, req dto.SearchSSHLog) (string, error)
@@ -89,35 +100,43 @@ func (u *SSHService) GetSSHInfo() (*dto.SSHInfo, error) {
 		data.AutoStart = enable
 	}
 
-	sshConf, err := os.ReadFile(sshPath)
+	lines, err := loadSSHConfigLines(sshPath, map[string]struct{}{})
 	if err != nil {
 		data.Message = err.Error()
 		data.IsActive = false
 	}
-	lines := strings.Split(string(sshConf), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "Port ") {
-			data.Port = strings.ReplaceAll(line, "Port ", "")
+	portSet := false
+	passwordAuthenticationSet := false
+	pubkeyAuthenticationSet := false
+	permitRootLoginSet := false
+	useDNSSet := false
+	for _, itemLine := range lines {
+		if item, ok := readSSHDirectiveValue(itemLine.Line, "Port"); ok && !portSet {
+			data.Port = item
+			portSet = true
 		}
-		if strings.HasPrefix(line, "ListenAddress ") {
-			itemAddr := strings.ReplaceAll(line, "ListenAddress ", "")
+		if itemAddr, ok := readSSHDirectiveValue(itemLine.Line, "ListenAddress"); ok {
 			if len(data.ListenAddress) != 0 {
 				data.ListenAddress += ("," + itemAddr)
 			} else {
 				data.ListenAddress = itemAddr
 			}
 		}
-		if strings.HasPrefix(line, "PasswordAuthentication ") {
-			data.PasswordAuthentication = strings.ReplaceAll(line, "PasswordAuthentication ", "")
+		if item, ok := readSSHDirectiveValue(itemLine.Line, "PasswordAuthentication"); ok && !passwordAuthenticationSet {
+			data.PasswordAuthentication = item
+			passwordAuthenticationSet = true
 		}
-		if strings.HasPrefix(line, "PubkeyAuthentication ") {
-			data.PubkeyAuthentication = strings.ReplaceAll(line, "PubkeyAuthentication ", "")
+		if item, ok := readSSHDirectiveValue(itemLine.Line, "PubkeyAuthentication"); ok && !pubkeyAuthenticationSet {
+			data.PubkeyAuthentication = item
+			pubkeyAuthenticationSet = true
 		}
-		if strings.HasPrefix(line, "PermitRootLogin ") {
-			data.PermitRootLogin = strings.ReplaceAll(strings.ReplaceAll(line, "PermitRootLogin ", ""), "prohibit-password", "without-password")
+		if item, ok := readSSHDirectiveValue(itemLine.Line, "PermitRootLogin"); ok && !permitRootLoginSet {
+			data.PermitRootLogin = strings.ReplaceAll(item, "prohibit-password", "without-password")
+			permitRootLoginSet = true
 		}
-		if strings.HasPrefix(line, "UseDNS ") {
-			data.UseDNS = strings.ReplaceAll(line, "UseDNS ", "")
+		if item, ok := readSSHDirectiveValue(itemLine.Line, "UseDNS"); ok && !useDNSSet {
+			data.UseDNS = item
+			useDNSSet = true
 		}
 	}
 
@@ -160,13 +179,18 @@ func (u *SSHService) Update(req dto.SSHUpdate) error {
 		return err
 	}
 
-	sshConf, err := os.ReadFile(sshPath)
+	targetFile, _ := loadSSHDirectiveSource(req.Key)
+	if len(targetFile) == 0 {
+		targetFile = sshPath
+	}
+
+	sshConf, err := os.ReadFile(targetFile)
 	if err != nil {
 		return err
 	}
 	lines := strings.Split(string(sshConf), "\n")
 	newFiles := updateSSHConf(lines, req.Key, req.NewValue)
-	file, err := os.OpenFile(sshPath, os.O_WRONLY|os.O_TRUNC, constant.FilePerm)
+	file, err := os.OpenFile(targetFile, os.O_WRONLY|os.O_TRUNC, constant.FilePerm)
 	if err != nil {
 		return err
 	}
@@ -582,7 +606,30 @@ func (u *SSHService) LoadSSHFile(name string) (string, error) {
 		fileName = currentUser.HomeDir + "/.ssh/authorized_keys"
 	case "sshdConf":
 		fileName = "/etc/ssh/sshd_config"
+	case "sshdConfEffective":
+		lines, err := loadSSHConfigLines(sshPath, map[string]struct{}{})
+		if err != nil {
+			return "", err
+		}
+		return renderSSHConfigWithSource(lines), nil
+	case "sshdConfOptions":
+		options, err := loadSSHConfigOptions()
+		if err != nil {
+			return "", err
+		}
+		data, err := json.Marshal(options)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
 	default:
+		if strings.HasPrefix(name, "sshdConfPath:") {
+			fileName = strings.TrimPrefix(name, "sshdConfPath:")
+			if !isAllowedSSHConfigPath(fileName) {
+				return "", buserr.New("ErrNotSupportType")
+			}
+			break
+		}
 		return "", buserr.WithName("ErrNotSupportType", name)
 	}
 	if _, err := os.Stat(fileName); err != nil {
@@ -595,7 +642,27 @@ func (u *SSHService) LoadSSHFile(name string) (string, error) {
 	return string(content), nil
 }
 
-func (u *SSHService) UpdateByFile(req dto.SettingUpdate) error {
+func renderSSHConfigWithSource(lines []sshConfigLine) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	currentFile := ""
+	for _, item := range lines {
+		if item.File != currentFile {
+			if builder.Len() != 0 {
+				builder.WriteString("\n")
+			}
+			builder.WriteString(fmt.Sprintf("# ===== %s =====\n", item.File))
+			currentFile = item.File
+		}
+		builder.WriteString(item.Line)
+		builder.WriteString("\n")
+	}
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+func (u *SSHService) UpdateByFile(req dto.SSHConfUpdate) error {
 	var fileName string
 	switch req.Key {
 	case "authKeys":
@@ -606,6 +673,11 @@ func (u *SSHService) UpdateByFile(req dto.SettingUpdate) error {
 		fileName = currentUser.HomeDir + "/.ssh/authorized_keys"
 	case "sshdConf":
 		fileName = "/etc/ssh/sshd_config"
+	case "sshdConfPath":
+		if !isAllowedSSHConfigPath(req.Path) {
+			return buserr.New("ErrNotSupportType")
+		}
+		fileName = req.Path
 	default:
 		return buserr.WithName("ErrNotSupportType", req.Key)
 	}
@@ -929,14 +1001,12 @@ func updateSSHSocketFile(newPort string) error {
 
 func loadSSHPort() string {
 	port := "22"
-	sshConf, err := os.ReadFile(sshPath)
+	lines, err := loadSSHConfigLines(sshPath, map[string]struct{}{})
 	if err != nil {
 		return port
 	}
-	lines := strings.Split(string(sshConf), "\n")
 	for _, line := range lines {
-		if strings.HasPrefix(line, "Port ") {
-			portStr := strings.ReplaceAll(line, "Port ", "")
+		if portStr, ok := readSSHDirectiveValue(line.Line, "Port"); ok {
 			portItem, _ := strconv.Atoi(portStr)
 			if portItem > 0 && portItem < 65535 {
 				return portStr
@@ -944,4 +1014,117 @@ func loadSSHPort() string {
 		}
 	}
 	return port
+}
+
+func loadSSHConfigLines(configPath string, visited map[string]struct{}) ([]sshConfigLine, error) {
+	configPath = filepath.Clean(configPath)
+	if _, ok := visited[configPath]; ok {
+		return []sshConfigLine{}, nil
+	}
+	visited[configPath] = struct{}{}
+
+	sshConf, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(sshConf), "\n")
+	var result []sshConfigLine
+	for _, line := range lines {
+		patterns, ok := readSSHIncludePatterns(line)
+		if !ok {
+			result = append(result, sshConfigLine{File: configPath, Line: line})
+			continue
+		}
+		baseDir := filepath.Dir(configPath)
+		for _, pattern := range patterns {
+			itemPattern := pattern
+			if !filepath.IsAbs(itemPattern) {
+				itemPattern = filepath.Join(baseDir, itemPattern)
+			}
+			itemFiles, err := filepath.Glob(itemPattern)
+			if err != nil {
+				continue
+			}
+			sort.Strings(itemFiles)
+			for _, itemFile := range itemFiles {
+				itemLines, err := loadSSHConfigLines(itemFile, visited)
+				if err != nil {
+					continue
+				}
+				result = append(result, itemLines...)
+			}
+		}
+	}
+	return result, nil
+}
+
+func loadSSHDirectiveSource(key string) (string, error) {
+	lines, err := loadSSHConfigLines(sshPath, map[string]struct{}{})
+	if err != nil {
+		return "", err
+	}
+	for _, line := range lines {
+		if _, ok := readSSHDirectiveValue(line.Line, key); ok {
+			return line.File, nil
+		}
+	}
+	return "", nil
+}
+
+func loadSSHConfigOptions() ([]sshConfigOption, error) {
+	lines, err := loadSSHConfigLines(sshPath, map[string]struct{}{})
+	if err != nil {
+		return nil, err
+	}
+	var options []sshConfigOption
+	seen := make(map[string]struct{})
+	for _, line := range lines {
+		if _, ok := seen[line.File]; ok {
+			continue
+		}
+		seen[line.File] = struct{}{}
+		options = append(options, sshConfigOption{
+			Path:     line.File,
+			Priority: len(options) + 1,
+		})
+	}
+	return options, nil
+}
+
+func isAllowedSSHConfigPath(configPath string) bool {
+	options, err := loadSSHConfigOptions()
+	if err != nil {
+		return false
+	}
+	configPath = filepath.Clean(configPath)
+	for _, item := range options {
+		if filepath.Clean(item.Path) == configPath {
+			return true
+		}
+	}
+	return false
+}
+
+func readSSHIncludePatterns(line string) ([]string, bool) {
+	line = strings.TrimSpace(line)
+	if len(line) == 0 || strings.HasPrefix(line, "#") {
+		return nil, false
+	}
+	items := strings.Fields(line)
+	if len(items) < 2 || !strings.EqualFold(items[0], "Include") {
+		return nil, false
+	}
+	return items[1:], true
+}
+
+func readSSHDirectiveValue(line string, key string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if len(line) == 0 || strings.HasPrefix(line, "#") {
+		return "", false
+	}
+	items := strings.Fields(line)
+	if len(items) < 2 || !strings.EqualFold(items[0], key) {
+		return "", false
+	}
+	return strings.Join(items[1:], " "), true
 }

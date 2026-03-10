@@ -143,12 +143,24 @@ func OperationLog() gin.HandlerFunc {
 			datas, _ = io.ReadAll(reader)
 		}
 		var res response
-		_ = json.Unmarshal(datas, &res)
-		if res.Code == 200 {
-			record.Status = constant.StatusSuccess
+		contentType := strings.ToLower(c.Writer.Header().Get("Content-Type"))
+		isJSONResponse := strings.Contains(contentType, "application/json")
+		if isJSONResponse {
+			_ = json.Unmarshal(datas, &res)
+			if res.Code == 200 {
+				record.Status = constant.StatusSuccess
+			} else {
+				record.Status = constant.StatusFailed
+				record.Message = res.Message
+			}
 		} else {
-			record.Status = constant.StatusFailed
-			record.Message = res.Message
+			statusCode := c.Writer.Status()
+			if statusCode >= 200 && statusCode < 400 {
+				record.Status = constant.StatusSuccess
+			} else {
+				record.Status = constant.StatusFailed
+				record.Message = http.StatusText(statusCode)
+			}
 		}
 
 		latency := time.Since(now)
